@@ -1,0 +1,170 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn import metrics
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from imblearn.over_sampling import RandomOverSampler
+from sklearn.metrics import ConfusionMatrixDisplay, classification_report
+import joblib
+import os
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Load and preprocess the dataset
+@st.cache_data
+def load_data():
+    df = pd.read_csv('Rainfall.csv')
+    df.rename(str.strip, axis='columns', inplace=True)
+    df.replace({'yes': 1, 'no': 0}, inplace=True)
+    df.drop(['maxtemp', 'mintemp'], axis=1, inplace=True)
+    return df
+
+# Train and evaluate models
+def train_and_evaluate(models, X, Y, X_val, Y_val):
+    results = {}
+    for model in models:
+        model_name = model._class.name_
+        model.fit(X, Y)
+        train_preds = model.predict_proba(X)
+        val_preds = model.predict_proba(X_val)
+
+        results[model_name] = {
+            'Training Accuracy': metrics.roc_auc_score(Y, train_preds[:, 1]),
+            'Validation Accuracy': metrics.roc_auc_score(Y_val, val_preds[:, 1]),
+            'Model': model
+        }
+    return results
+
+def main():
+    st.title("🌧 Rainfall Prediction App")
+
+    df = load_data()
+
+    st.sidebar.header("Preprocessing Options")
+    impute_strategy = st.sidebar.selectbox("Imputation Strategy", ['mean', 'median', 'most_frequent'], index=0)
+
+    features = df.drop(['day', 'rainfall'], axis=1)
+    target = df['rainfall']
+    X_train, X_val, Y_train, Y_val = train_test_split(features, target, test_size=0.2, stratify=target, random_state=2)
+
+    # Oversampling
+    ros = RandomOverSampler(sampling_strategy='minority', random_state=22)
+    X_train, Y_train = ros.fit_resample(X_train, Y_train)
+
+    # Imputation
+    imputer = SimpleImputer(strategy=impute_strategy)
+    X_train = imputer.fit_transform(X_train)
+    X_val = imputer.transform(X_val)
+
+    # Scaling
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    st.sidebar.header("Model Selection")
+    models_to_train = st.sidebar.multiselect(
+        "Choose Models to Train",
+        ['Logistic Regression', 'XGBoost', 'SVC'],
+        default=['Logistic Regression', 'XGBoost', 'SVC']
+    )
+
+    model_mapping = {
+        'Logistic Regression': LogisticRegression(),
+        'XGBoost': XGBClassifier(use_label_encoder=False, eval_metric='logloss'),
+        'SVC': SVC(kernel='rbf', probability=True)
+    }
+
+    selected_models = [model_mapping[model_name] for model_name in models_to_train]
+
+    best_model = None
+
+    if st.sidebar.button("Train and Evaluate Models"):
+        with st.spinner("Training models..."):
+            results = train_and_evaluate(selected_models, X_train, Y_train, X_val, Y_val)
+
+        st.subheader("Model Performance")
+        for model_name, metrics_dict in results.items():
+            st.write(f"### {model_name}")
+            st.write(f"Training AUC: {metrics_dict['Training Accuracy']:.2f}")
+            st.write(f"Validation AUC: {metrics_dict['Validation Accuracy']:.2f}")
+
+        best_model_name = max(results, key=lambda name: results[name]['Validation Accuracy'])
+        best_model = results[best_model_name]['Model']
+        joblib.dump(best_model, "best_model.pkl")
+        st.success(f"Best Model Saved: {best_model_name} (saved as best_model.pkl)")
+
+        st.write(f"### Confusion Matrix for {best_model_name}")
+        fig, ax = plt.subplots()
+        ConfusionMatrixDisplay.from_estimator(best_model, X_val, Y_val, ax=ax)
+        st.pyplot(fig)
+
+        st.write("### Classification Report")
+        st.text(classification_report(Y_val, best_model.predict(X_val)))
+
+    # Load model if exists
+    if os.path.exists("best_model.pkl"):
+        loaded_model = joblib.load("best_model.pkl")
+        st.sidebar.success("Loaded trained model from file.")
+    else:
+        loaded_model = None
+
+    # Prediction from existing date
+    # st.subheader("🔎 Predict Rainfall by Date (from dataset)")
+    date_input = st.text_input
+    # ("Enter a date from the dataset (format: YYYY-MM-DD):")
+
+    if date_input:
+        if date_input in df['day'].values:
+            row = df[df['day'] == date_input]
+            input_data = row.drop(['day', 'rainfall'], axis=1)
+
+            input_data = imputer.transform(input_data)
+            input_data = scaler.transform(input_data)
+
+            model_to_use = loaded_model or best_model
+            if model_to_use:
+                prediction = model_to_use.predict(input_data)[0]
+                prob = model_to_use.predict_proba(input_data)[0][1]
+
+                st.write("🌧 Prediction:", "Yes" if prediction == 1 else "No")
+                st.write("📈 Probability of Rainfall:", f"{prob:.2f}")
+            else:
+                st.warning("Train or load a model first.")
+        else:
+            st.error("Date not found in dataset.")
+
+    # Predict for future
+    st.subheader("📅 Predict Rainfall for Future (Manual Input)")
+    model_to_use = loaded_model or best_model
+
+    if model_to_use:
+        user_input = {}
+        for col in features.columns:
+            if df[col].dtype in ['int64', 'float64']:
+                user_input[col] = st.number_input(f"Enter {col}", value=float(df[col].mean()))
+            else:
+                options = sorted(df[col].dropna().unique())
+                user_input[col] = st.selectbox(f"Select {col}", options)
+
+        if st.button("Predict for Manual Input"):
+            input_df = pd.DataFrame([user_input])
+            input_df = imputer.transform(input_df)
+            input_df = scaler.transform(input_df)
+
+            prediction = model_to_use.predict(input_df)[0]
+            prob = model_to_use.predict_proba(input_df)[0][1]
+
+            st.write("🌧 Prediction:", "Yes" if prediction == 1 else "No")
+            st.write("📈 Probability of Rainfall:", f"{prob:.2f}")
+    else:
+        st.info("Train or load a model to enable manual prediction.")
+
+if _name_ == "_main_":
+    main()
